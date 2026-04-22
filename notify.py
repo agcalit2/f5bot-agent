@@ -5,7 +5,7 @@ import re
 import smtplib
 from email.mime.text import MIMEText
 
-from reddit import RedditPost
+from analyze import AnalyzedPost
 
 
 def _get_smtp_config() -> tuple[str, str, str]:
@@ -44,30 +44,30 @@ def send_notification(reenabled: list[str]) -> None:
 _MAX_ANALYSES = int(os.environ.get("MAX_ANALYSES", "5"))
 
 
-def send_analyses(results: list[tuple[RedditPost, str]]) -> None:
+def send_analyses(results: list[tuple[AnalyzedPost, str]]) -> None:
     if not results:
         return
     smtp_email, smtp_password, recipient = _get_smtp_config()
-    top5 = sorted(
+    flagged = sorted(
         [(p, a) for p, a in results if not a.strip().upper().startswith("SKIP")],
         key=lambda r: r[0].score,
         reverse=True,
     )[:_MAX_ANALYSES]
-    skipped = len(results) - len(top5)
+    skipped = len(results) - len(flagged)
     summary = (
         f"F5Bot: {len(results)} post(s) analyzed — "
-        f"{len(top5)} flagged, {skipped} skipped."
+        f"{len(flagged)} flagged, {skipped} skipped."
     )
     _send_sms(smtp_email, smtp_password, recipient, "F5Bot Summary", summary)
     print(f"Summary sent: {summary}")
 
-    for i, (post, analysis) in enumerate(top5, start=1):
+    for i, (post, analysis) in enumerate(flagged, start=1):
         title = post.title[:60] + ("…" if len(post.title) > 60 else "")
         body = (
-            f"[{i}/{len(top5)}] r/{post.subreddit}: {title}\n"
+            f"[{i}/{len(flagged)}] r/{post.subreddit}: {title}\n"
             f"{post.permalink}\n"
             f"---\n"
             f"{analysis[:600]}"
         )
-        _send_sms(smtp_email, smtp_password, recipient, f"F5Bot Analysis [{i}/{len(top5)}]", body)
-        print(f"Analysis {i}/{len(top5)} sent to {recipient}")
+        _send_sms(smtp_email, smtp_password, recipient, f"F5Bot Analysis [{i}/{len(flagged)}]", body)
+        print(f"Analysis {i}/{len(flagged)} sent to {recipient}")

@@ -2,22 +2,55 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import re
 import time
+from dataclasses import dataclass
 
 import anthropic
 import httpx
-
-from reddit import RedditPost
 
 _PRODUCT_FILE = "PRODUCT.md"
 _STRATEGY_FILE = "STRATEGY.md"
 _INSIGHTS_FILE = "INSIGHTS.md"
 
 _MAX_PAGE_CHARS = 8_000
+_MAX_FETCH_CHARS = 40_000
 _RESEARCH_MODEL = "claude-opus-4-7"
 _ANALYSIS_MODEL = "claude-sonnet-4-6"
 _INSIGHTS_MAX_AGE_DAYS = int(os.environ.get("INSIGHTS_MAX_AGE_DAYS", "7"))
+_ANALYSIS_CONCURRENCY = int(os.environ.get("ANALYSIS_CONCURRENCY", "3"))
+_MAX_RETRIES = 4
+
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+@dataclass
+class AnalyzedPost:
+    url: str
+    keyword: str
+    title: str
+    subreddit: str
+    permalink: str
+    score: int
+
+
+def _create_with_retry(client: anthropic.Anthropic, **kwargs) -> anthropic.types.Message:
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return client.messages.create(**kwargs)
+        except anthropic.RateLimitError as exc:
+            if attempt == _MAX_RETRIES - 1:
+                raise
+            headers = getattr(getattr(exc, "response", None), "headers", {})
+            retry_after = float(headers.get("retry-after", 2 ** attempt))
+            wait = retry_after + random.uniform(0, 1)
+            print(f"[analyze] Rate limited — retrying in {wait:.1f}s (attempt {attempt + 1}/{_MAX_RETRIES})")
+            time.sleep(wait)
 
 
 def _fetch_url_text(url: str) -> str:
@@ -25,10 +58,18 @@ def _fetch_url_text(url: str) -> str:
         resp = httpx.get(url, timeout=10.0, follow_redirects=True,
                          headers={"User-Agent": "f5bot-agent/1.0"})
         text = resp.text
-        # Strip HTML tags roughly
         text = re.sub(r"<[^>]+>", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
         return text[:_MAX_PAGE_CHARS]
+    except Exception as e:
+        return f"(failed to fetch {url}: {e})"
+
+
+def _do_fetch(url: str) -> str:
+    try:
+        resp = httpx.get(url, timeout=15.0, follow_redirects=True,
+                         headers={"User-Agent": _BROWSER_UA})
+        return resp.text[:_MAX_FETCH_CHARS]
     except Exception as e:
         return f"(failed to fetch {url}: {e})"
 
@@ -58,7 +99,6 @@ def research_product() -> str:
 
     system_prompt = "You are a product research analyst helping craft organic Reddit advertising strategy."
 
-    # Build base content blocks with competitor pages cached
     base_content: list[dict] = [
         {"type": "text", "text": f"## Product Description\n\n{product_text}\n\n## Competitor Pages\n\n"},
     ]
@@ -68,11 +108,10 @@ def research_product() -> str:
             entry["cache_control"] = {"type": "ephemeral"}
         base_content.append(entry)
 
-    # Step 1: Summarize each competitor individually
     step1_content = base_content + [
         {"type": "text", "text": "Summarize each competitor site above in 3-5 bullet points: what they offer, their positioning, and their apparent strengths."}
     ]
-    step1_resp = client.messages.create(
+    step1_resp = _create_with_retry(client,
         model=_RESEARCH_MODEL,
         max_tokens=1024,
         system=system_prompt,
@@ -81,8 +120,7 @@ def research_product() -> str:
     competitor_summaries = step1_resp.content[0].text
     print("[analyze] Step 1/3: Competitor summaries done")
 
-    # Step 2: Comparative analysis — cache the summaries from step 1
-    step2_resp = client.messages.create(
+    step2_resp = _create_with_retry(client,
         model=_RESEARCH_MODEL,
         max_tokens=1024,
         system=system_prompt,
@@ -111,8 +149,7 @@ def research_product() -> str:
     comparative_analysis = step2_resp.content[0].text
     print("[analyze] Step 2/3: Comparative analysis done")
 
-    # Step 3: Final synthesis — ideal customer, talking points, Reddit positioning
-    step3_resp = client.messages.create(
+    step3_resp = _create_with_retry(client,
         model=_RESEARCH_MODEL,
         max_tokens=1024,
         system=system_prompt,
@@ -149,53 +186,116 @@ def research_product() -> str:
     return insights
 
 
-def _analyze_post_sync(post: RedditPost, insights: str, strategy: str) -> str:
+_FETCH_TOOL = {
+    "name": "fetch_url",
+    "description": "Fetch the raw text content of a URL.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "The URL to fetch"},
+        },
+        "required": ["url"],
+    },
+}
+
+
+def _analyze_link_sync(url: str, keyword: str, insights: str, strategy: str) -> tuple[AnalyzedPost, str]:
     client = anthropic.Anthropic()
 
-    response = client.messages.create(
-        model=_ANALYSIS_MODEL,
-        max_tokens=800,
-        system=[
-            {
-                "type": "text",
-                "text": f"## Advertising Strategy\n\n{strategy}",
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        messages=[
-            {
+    messages: list[dict] = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": f"## Product Insights\n\n{insights}",
+                    "cache_control": {"type": "ephemeral"},
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        f"Reddit post URL: {url}\n"
+                        f"Keyword that matched: {keyword}\n\n"
+                        f"Fetch `{url}.json?limit=500`, extract the post title, subreddit, permalink, "
+                        "and score from the JSON response, then decide whether to FLAG or SKIP based on "
+                        "the strategy and product insights above.\n\n"
+                        "Respond in exactly this format:\n"
+                        "TITLE: <post title>\n"
+                        "SUBREDDIT: <subreddit name>\n"
+                        "PERMALINK: <full permalink url>\n"
+                        "SCORE: <integer>\n\n"
+                        "Then either:\n"
+                        "FLAG followed by:\n"
+                        "  HOOK: <specific comment/question/section that is the entry point>\n"
+                        "  WHY: <2-3 sentences on why this is a good opportunity>\n"
+                        "  APPROACH: <3-5 sentences on recommended angle, tone, and specifics to reference>\n"
+                        "  Do not draft the comment itself.\n"
+                        "Or:\n"
+                        "SKIP <one sentence reason>\n\n"
+                        "Start your response with TITLE: on the first line."
+                    ),
+                },
+            ],
+        }
+    ]
+
+    for _ in range(5):
+        response = _create_with_retry(client,
+            model=_ANALYSIS_MODEL,
+            max_tokens=1200,
+            system=[
+                {
+                    "type": "text",
+                    "text": f"## Advertising Strategy\n\n{strategy}",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            tools=[_FETCH_TOOL],
+            messages=messages,
+        )
+
+        if response.stop_reason == "tool_use":
+            tool_block = next(b for b in response.content if b.type == "tool_use")
+            result_text = _do_fetch(tool_block.input["url"])
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({
                 "role": "user",
                 "content": [
                     {
-                        "type": "text",
-                        "text": f"## Product Insights\n\n{insights}",
-                        "cache_control": {"type": "ephemeral"},
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            f"## Reddit Post\n\n{str(post)}\n\n"
-                            "Based on the strategy and product insights above, should we engage with this post?\n"
-                            "- If YES: flag the post using this structure:\n"
-                            "  HOOK: Identify the specific comment, question, or section that is the entry point.\n"
-                            "  WHY: Explain in 2-3 sentences why this is a good opportunity — what pain point or gap "
-                            "is being expressed, and why our product is a natural fit here.\n"
-                            "  APPROACH: Outline in 3-5 sentences the recommended angle — what to lead with, "
-                            "how to frame the product mention naturally, what tone to use, and any specific "
-                            "detail from the thread to reference so the response feels genuine.\n"
-                            "  Do not draft the comment itself.\n"
-                            "- If NO: explain why in one sentence.\n"
-                            "Start your response with either FLAG or SKIP."
-                        ),
-                    },
+                        "type": "tool_result",
+                        "tool_use_id": tool_block.id,
+                        "content": result_text,
+                    }
                 ],
-            }
-        ],
+            })
+        else:
+            break
+    else:
+        print(f"[analyze] Warning: tool-use loop hit max iterations for {url}")
+
+    raw = response.content[0].text
+
+    title_m = re.search(r"^TITLE:\s*(.+)", raw, re.MULTILINE)
+    sub_m = re.search(r"^SUBREDDIT:\s*(.+)", raw, re.MULTILINE)
+    perma_m = re.search(r"^PERMALINK:\s*(.+)", raw, re.MULTILINE)
+    score_m = re.search(r"^SCORE:\s*(\d+)", raw, re.MULTILINE)
+
+    post = AnalyzedPost(
+        url=url,
+        keyword=keyword,
+        title=title_m.group(1).strip() if title_m else "(unknown)",
+        subreddit=sub_m.group(1).strip() if sub_m else "(unknown)",
+        permalink=perma_m.group(1).strip() if perma_m else url,
+        score=int(score_m.group(1)) if score_m else 0,
     )
-    return response.content[0].text
+
+    analysis_m = re.search(r"(FLAG|SKIP).*", raw, re.DOTALL)
+    analysis_text = analysis_m.group(0).strip() if analysis_m else raw
+
+    return post, analysis_text
 
 
-async def run_analysis(posts: list[RedditPost]) -> list[tuple[RedditPost, str]]:
+async def run_analysis(links: list[tuple[str, str]]) -> list[tuple[AnalyzedPost, str]]:
     if not os.path.exists(_STRATEGY_FILE):
         raise FileNotFoundError(
             f"{_STRATEGY_FILE} not found. Create it with your advertising strategy."
@@ -204,9 +304,11 @@ async def run_analysis(posts: list[RedditPost]) -> list[tuple[RedditPost, str]]:
 
     insights = research_product()
 
-    tasks = [
-        asyncio.to_thread(_analyze_post_sync, post, insights, strategy)
-        for post in posts
-    ]
-    analyses = await asyncio.gather(*tasks)
-    return list(zip(posts, analyses))
+    sem = asyncio.Semaphore(_ANALYSIS_CONCURRENCY)
+
+    async def _bounded(url: str, keyword: str) -> tuple[AnalyzedPost, str]:
+        async with sem:
+            return await asyncio.to_thread(_analyze_link_sync, url, keyword, insights, strategy)
+
+    results = await asyncio.gather(*[_bounded(url, kw) for url, kw in links])
+    return list(results)

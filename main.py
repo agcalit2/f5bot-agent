@@ -5,7 +5,6 @@ from playwright.async_api import async_playwright
 from f5bot import login, reenable_keywords
 from notify import send_notification, send_analyses
 from gmail import fetch_new_threads
-from reddit import fetch_posts_batch
 from analyze import run_analysis
 
 
@@ -35,10 +34,8 @@ async def run() -> None:
             if link not in seen_urls:
                 seen_urls.add(link)
                 links.append((link, keyword))
-    posts = await fetch_posts_batch(links)
-
-    if posts:
-        results = await run_analysis(posts)
+    if links:
+        results = await run_analysis(links)
         for post, analysis in results:
             print(f"\n=== {post.title} ===")
             print(f"r/{post.subreddit} | {post.permalink}")
