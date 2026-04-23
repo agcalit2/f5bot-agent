@@ -255,19 +255,17 @@ def _analyze_link_sync(url: str, keyword: str, insights: str, strategy: str) -> 
         )
 
         if response.stop_reason == "tool_use":
-            tool_block = next(b for b in response.content if b.type == "tool_use")
-            result_text = _do_fetch(tool_block.input["url"])
+            tool_blocks = [b for b in response.content if b.type == "tool_use"]
+            tool_results = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tb.id,
+                    "content": _do_fetch(tb.input["url"]),
+                }
+                for tb in tool_blocks
+            ]
             messages.append({"role": "assistant", "content": response.content})
-            messages.append({
-                "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_block.id,
-                        "content": result_text,
-                    }
-                ],
-            })
+            messages.append({"role": "user", "content": tool_results})
         else:
             break
     else:
