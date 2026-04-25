@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
 import re
@@ -9,6 +10,14 @@ from dataclasses import dataclass
 
 import anthropic
 import httpx
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from openai import OpenAI
+from tqdm import tqdm
+from tqdm.asyncio import tqdm as atqdm
+
+load_dotenv()
 
 _PRODUCT_FILE = "PRODUCT.md"
 _STRATEGY_FILE = "STRATEGY.md"
@@ -17,7 +26,10 @@ _INSIGHTS_FILE = "INSIGHTS.md"
 _MAX_PAGE_CHARS = 8_000
 _MAX_FETCH_CHARS = 40_000
 _RESEARCH_MODEL = "claude-opus-4-7"
-_ANALYSIS_MODEL = "claude-sonnet-4-6"
+_GEMINI_MODEL = "gemini-2.0-flash"
+_OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+_OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY", "ollama")
+_ANALYSIS_MODEL = os.environ.get("GEMMA_MODEL", "gemma4:e2b")
 _INSIGHTS_MAX_AGE_DAYS = int(os.environ.get("INSIGHTS_MAX_AGE_DAYS", "7"))
 _ANALYSIS_CONCURRENCY = int(os.environ.get("ANALYSIS_CONCURRENCY", "3"))
 _MAX_RETRIES = 4
@@ -65,14 +77,6 @@ def _fetch_url_text(url: str) -> str:
         return f"(failed to fetch {url}: {e})"
 
 
-def _do_fetch(url: str) -> str:
-    try:
-        resp = httpx.get(url, timeout=15.0, follow_redirects=True,
-                         headers={"User-Agent": _BROWSER_UA})
-        return resp.text[:_MAX_FETCH_CHARS]
-    except Exception as e:
-        return f"(failed to fetch {url}: {e})"
-
 
 def research_product() -> str:
     if os.path.exists(_INSIGHTS_FILE):
@@ -90,7 +94,7 @@ def research_product() -> str:
 
     urls = re.findall(r"https?://\S+", product_text)
     competitor_blocks = []
-    for url in urls:
+    for url in tqdm(urls, desc="Fetching competitors", unit="url"):
         url = url.rstrip(".,)")
         content = _fetch_url_text(url)
         competitor_blocks.append({"url": url, "content": content})
@@ -187,110 +191,150 @@ def research_product() -> str:
 
 
 _FETCH_TOOL = {
-    "name": "fetch_url",
-    "description": "Fetch the raw text content of a URL.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "url": {"type": "string", "description": "The URL to fetch"},
+    "type": "function",
+    "function": {
+        "name": "fetch_url",
+        "description": "Fetch the raw text content of a URL.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The URL to fetch"},
+            },
+            "required": ["url"],
         },
-        "required": ["url"],
     },
 }
 
 
+_FETCH_RETRY_STATUSES = {429, 500, 502, 503, 504}
+_FETCH_MAX_RETRIES = 3
+
+
+def _fetch_via_gemini(url: str) -> str:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print(f"[analyze] 403 on {url} — could not recover (GEMINI_API_KEY not set)")
+        return "(GEMINI_API_KEY not set, cannot fall back to Gemini)"
+    print(f"[analyze] 403 on {url} — attempting Gemini recovery")
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=_GEMINI_MODEL,
+            contents=(
+                f"Retrieve and return the full content of this Reddit post, including "
+                f"the title, score, subreddit, post body, and top comments: {url}"
+            ),
+            config=types.GenerateContentConfig(
+                tools=[types.Tool(google_search=types.GoogleSearch())]
+            ),
+        )
+        if response.text:
+            print(f"[analyze] 403 on {url} — recovered via Gemini")
+            return response.text[:_MAX_FETCH_CHARS]
+        print(f"[analyze] 403 on {url} — could not recover (Gemini returned no content)")
+        return "(Gemini returned no content)"
+    except Exception as e:
+        print(f"[analyze] 403 on {url} — could not recover (Gemini error: {e})")
+        return f"(Gemini fallback failed: {e})"
+
+
+def _do_fetch(url: str) -> str:
+    for attempt in range(_FETCH_MAX_RETRIES):
+        try:
+            resp = httpx.get(url, timeout=15.0, follow_redirects=True,
+                             headers={"User-Agent": _BROWSER_UA})
+            resp.raise_for_status()
+            return resp.text[:_MAX_FETCH_CHARS]
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            if status == 403:
+                return _fetch_via_gemini(url)
+            if status not in _FETCH_RETRY_STATUSES or attempt == _FETCH_MAX_RETRIES - 1:
+                print(f"[analyze] HTTP {status} fetching {url}")
+                return f"(HTTP {status} error fetching {url})"
+            wait = float(e.response.headers.get("retry-after", 2 ** attempt)) + random.uniform(0, 1)
+            print(f"[analyze] HTTP {status} fetching {url} — retrying in {wait:.1f}s (attempt {attempt + 1}/{_FETCH_MAX_RETRIES})")
+            time.sleep(wait)
+        except httpx.RequestError as e:
+            if attempt == _FETCH_MAX_RETRIES - 1:
+                print(f"[analyze] Network error fetching {url}: {e}")
+                return f"(network error fetching {url}: {e})"
+            wait = 2 ** attempt + random.uniform(0, 1)
+            print(f"[analyze] Network error fetching {url}: {e} — retrying in {wait:.1f}s (attempt {attempt + 1}/{_FETCH_MAX_RETRIES})")
+            time.sleep(wait)
+
+
 def _analyze_link_sync(url: str, keyword: str, insights: str, strategy: str) -> tuple[AnalyzedPost, str]:
-    client = anthropic.Anthropic()
+    client = OpenAI(base_url=_OLLAMA_BASE_URL, api_key=_OLLAMA_API_KEY)
 
     messages: list[dict] = [
         {
+            "role": "system",
+            "content": f"## Advertising Strategy\n\n{strategy}\n\n## Product Insights\n\n{insights}",
+        },
+        {
             "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": f"## Product Insights\n\n{insights}",
-                    "cache_control": {"type": "ephemeral"},
-                },
-                {
-                    "type": "text",
-                    "text": (
-                        f"Reddit post URL: {url}\n"
-                        f"Keyword that matched: {keyword}\n\n"
-                        f"Fetch `{url}.json?limit=500`, extract the post title, subreddit, permalink, "
-                        "and score from the JSON response, then decide whether to FLAG or SKIP based on "
-                        "the strategy and product insights above.\n\n"
-                        "Respond in exactly this format:\n"
-                        "TITLE: <post title>\n"
-                        "SUBREDDIT: <subreddit name>\n"
-                        "PERMALINK: <full permalink url>\n"
-                        "SCORE: <integer>\n\n"
-                        "Then either:\n"
-                        "FLAG followed by:\n"
-                        "  HOOK: <specific comment/question/section that is the entry point>\n"
-                        "  WHY: <2-3 sentences on why this is a good opportunity>\n"
-                        "  APPROACH: <3-5 sentences on recommended angle, tone, and specifics to reference>\n"
-                        "  Do not draft the comment itself.\n"
-                        "Or:\n"
-                        "SKIP <one sentence reason>\n\n"
-                        "Start your response with TITLE: on the first line."
-                    ),
-                },
-            ],
-        }
+            "content": (
+                f"Reddit post URL: {url}\n"
+                f"Keyword that matched: {keyword}\n\n"
+                f"Fetch `{url.split('?')[0].rstrip('/')}.json?limit=500`, extract the post title, subreddit, "
+                "and score from the JSON response, then decide whether to FLAG or SKIP based on "
+                "the strategy and product insights above.\n\n"
+                "Respond in exactly this format:\n"
+                "TITLE: <post title>\n"
+                "SUBREDDIT: <subreddit name>\n"
+                "SCORE: <integer>\n\n"
+                "Then either:\n"
+                "FLAG followed by:\n"
+                "  HOOK: <specific comment/question/section that is the entry point>\n"
+                "  WHY: <2-3 sentences on why this is a good opportunity>\n"
+                "  APPROACH: <3-5 sentences on recommended angle, tone, and specifics to reference>\n"
+                "  Do not draft the comment itself.\n"
+                "Or:\n"
+                "SKIP <one sentence reason>\n\n"
+                "Start your response with TITLE: on the first line."
+            ),
+        },
     ]
 
     for _ in range(5):
-        response = _create_with_retry(client,
+        response = client.chat.completions.create(
             model=_ANALYSIS_MODEL,
             max_tokens=1200,
-            system=[
-                {
-                    "type": "text",
-                    "text": f"## Advertising Strategy\n\n{strategy}",
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
             tools=[_FETCH_TOOL],
             messages=messages,
         )
-
-        if response.stop_reason == "tool_use":
-            tool_blocks = [b for b in response.content if b.type == "tool_use"]
-            tool_results = [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tb.id,
-                    "content": _do_fetch(tb.input["url"]),
-                }
-                for tb in tool_blocks
-            ]
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
+        msg = response.choices[0].message
+        if msg.tool_calls:
+            messages.append(msg.model_dump(exclude_none=True))
+            for tc in msg.tool_calls:
+                args = json.loads(tc.function.arguments or "{}")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": _do_fetch(args["url"]),
+                })
         else:
             break
     else:
         print(f"[analyze] Warning: tool-use loop hit max iterations for {url}")
 
-    raw = response.content[0].text
+    raw = msg.content or ""
 
     title_m = re.search(r"^TITLE:\s*(.+)", raw, re.MULTILINE)
     sub_m = re.search(r"^SUBREDDIT:\s*(.+)", raw, re.MULTILINE)
-    perma_m = re.search(r"^PERMALINK:\s*(.+)", raw, re.MULTILINE)
     score_m = re.search(r"^SCORE:\s*(\d+)", raw, re.MULTILINE)
+    analysis_m = re.search(r"(FLAG|SKIP).*", raw, re.DOTALL)
 
     post = AnalyzedPost(
         url=url,
         keyword=keyword,
         title=title_m.group(1).strip() if title_m else "(unknown)",
         subreddit=sub_m.group(1).strip() if sub_m else "(unknown)",
-        permalink=perma_m.group(1).strip() if perma_m else url,
+        permalink=url,
         score=int(score_m.group(1)) if score_m else 0,
     )
-
-    analysis_m = re.search(r"(FLAG|SKIP).*", raw, re.DOTALL)
-    analysis_text = analysis_m.group(0).strip() if analysis_m else raw
-
-    return post, analysis_text
+    return post, analysis_m.group(0).strip() if analysis_m else raw
 
 
 async def run_analysis(links: list[tuple[str, str]]) -> list[tuple[AnalyzedPost, str]]:
@@ -308,5 +352,16 @@ async def run_analysis(links: list[tuple[str, str]]) -> list[tuple[AnalyzedPost,
         async with sem:
             return await asyncio.to_thread(_analyze_link_sync, url, keyword, insights, strategy)
 
-    results = await asyncio.gather(*[_bounded(url, kw) for url, kw in links])
-    return list(results)
+    results = await atqdm.gather(
+        *[_bounded(url, kw) for url, kw in links],
+        desc="Analyzing posts",
+        unit="post",
+    )
+    results = list(results)
+
+    total = len(results)
+    fetched = sum(1 for post, _ in results if post.title != "(unknown)")
+    flagged = sum(1 for _, analysis in results if analysis.startswith("FLAG"))
+    print(f"[analyze] Done: {total} posts | {fetched}/{total} fetched | {flagged} flagged | {total - flagged} skipped")
+
+    return results
