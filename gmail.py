@@ -68,6 +68,4 @@ def fetch_new_threads() -> list[dict]:
                 "reddit_links": reddit_links,
             })
 
-        save_seen(seen | set(new_uids))
-
-    return results
+    return results, seen | set(new_uids)
