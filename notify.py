@@ -1,44 +1,32 @@
 from __future__ import annotations
-
 import os
-import re
-import smtplib
-from email.mime.text import MIMEText
-
+import httpx
+from dotenv import load_dotenv
 from analyze import AnalyzedPost
 
-
-def _get_smtp_config() -> tuple[str, str, str]:
-    smtp_email = os.environ["SMTP_EMAIL"]
-    smtp_password = os.environ["SMTP_PASSWORD"]
-    carrier_gateway = os.environ["CARRIER_GATEWAY"]
-    raw_phone = os.environ["PHONE_NUMBER"]
-    digits = re.sub(r"\D", "", raw_phone)
-    if digits.startswith("1") and len(digits) == 11:
-        digits = digits[1:]
-    recipient = f"{digits}@{carrier_gateway}"
-    return smtp_email, smtp_password, recipient
+load_dotenv()
 
 
-def _send_sms(smtp_email: str, smtp_password: str, recipient: str, subject: str, body: str) -> None:
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = smtp_email
-    msg["To"] = recipient
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
-        server.starttls()
-        server.login(smtp_email, smtp_password)
-        server.sendmail(smtp_email, recipient, msg.as_string())
+def _get_telegram_config() -> tuple[str, str]:
+    token = os.environ["TELEGRAM_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    return token, chat_id
+
+
+def _send_telegram(token: str, chat_id: str, text: str) -> None:
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    resp = httpx.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10.0)
+    resp.raise_for_status()
 
 
 def send_notification(reenabled: list[str]) -> None:
-    smtp_email, smtp_password, recipient = _get_smtp_config()
+    token, chat_id = _get_telegram_config()
     if reenabled:
-        body = f"F5Bot: Re-enabled {len(reenabled)} keyword(s): {', '.join(reenabled)}"
+        text = f"F5Bot: Re-enabled {len(reenabled)} keyword(s): {', '.join(reenabled)}"
     else:
-        body = "F5Bot: All keywords were already enabled. No changes made."
-    _send_sms(smtp_email, smtp_password, recipient, "F5Bot Keywords Update", body)
-    print(f"Notification sent to {recipient}")
+        text = "F5Bot: All keywords were already enabled. No changes made."
+    _send_telegram(token, chat_id, text)
+    print(f"Notification sent to Telegram chat {chat_id}")
 
 
 _MAX_ANALYSES = int(os.environ.get("MAX_ANALYSES", "5"))
@@ -47,7 +35,7 @@ _MAX_ANALYSES = int(os.environ.get("MAX_ANALYSES", "5"))
 def send_analyses(results: list[tuple[AnalyzedPost, str]]) -> None:
     if not results:
         return
-    smtp_email, smtp_password, recipient = _get_smtp_config()
+    token, chat_id = _get_telegram_config()
     flagged = sorted(
         [(p, a) for p, a in results if not a.strip().upper().startswith("SKIP")],
         key=lambda r: r[0].score,
@@ -58,16 +46,16 @@ def send_analyses(results: list[tuple[AnalyzedPost, str]]) -> None:
         f"F5Bot: {len(results)} post(s) analyzed — "
         f"{len(flagged)} flagged, {skipped} skipped."
     )
-    _send_sms(smtp_email, smtp_password, recipient, "F5Bot Summary", summary)
+    _send_telegram(token, chat_id, summary)
     print(f"Summary sent: {summary}")
 
     for i, (post, analysis) in enumerate(flagged, start=1):
-        title = post.title[:60] + ("…" if len(post.title) > 60 else "")
-        body = (
-            f"[{i}/{len(flagged)}] r/{post.subreddit}: {title}\n"
+        text = (
+            f"<b>[{i}/{len(flagged)}] r/{post.subreddit}</b>\n"
+            f"<i>{post.title}</i>\n"
             f"{post.permalink}\n"
-            f"---\n"
-            f"{analysis[:600]}"
+            f"\n"
+            f"{analysis[:2000]}"
         )
-        _send_sms(smtp_email, smtp_password, recipient, f"F5Bot Analysis [{i}/{len(flagged)}]", body)
-        print(f"Analysis {i}/{len(flagged)} sent to {recipient}")
+        _send_telegram(token, chat_id, text)
+        print(f"Analysis {i}/{len(flagged)} sent to Telegram")

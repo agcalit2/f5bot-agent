@@ -1,11 +1,33 @@
 import asyncio
 import re
+import subprocess
+import time
+import urllib.request
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 from f5bot import login, reenable_keywords
 from notify import send_notification, send_analyses
 from gmail import fetch_new_threads
 from analyze import run_analysis
+
+
+def _ensure_ollama() -> None:
+    try:
+        urllib.request.urlopen("http://localhost:11434", timeout=2)
+        return  # already running
+    except Exception:
+        pass
+    print("Starting ollama serve...")
+    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(20):
+        time.sleep(1)
+        try:
+            urllib.request.urlopen("http://localhost:11434", timeout=2)
+            print("Ollama ready.")
+            return
+        except Exception:
+            pass
+    raise RuntimeError("Ollama did not start within 20 seconds")
 
 
 def extract_keyword(subject: str) -> str:
@@ -35,6 +57,7 @@ async def run() -> None:
                 seen_urls.add(link)
                 links.append((link, keyword))
     if links:
+        _ensure_ollama()
         results = await run_analysis(links)
         for post, analysis in results:
             print(f"\n=== {post.title} ===")
