@@ -1,33 +1,13 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import re
-import subprocess
-import time
-import urllib.request
-from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 from f5bot import login, reenable_keywords
-from notify import send_notification, send_analyses
-from gmail import fetch_new_threads
+from notify import send_notification, send_post
+from gmail import fetch_new_threads, save_seen
 from analyze import run_analysis
-
-
-def _ensure_ollama() -> None:
-    try:
-        urllib.request.urlopen("http://localhost:11434", timeout=2)
-        return  # already running
-    except Exception:
-        pass
-    print("Starting ollama serve...")
-    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(20):
-        time.sleep(1)
-        try:
-            urllib.request.urlopen("http://localhost:11434", timeout=2)
-            print("Ollama ready.")
-            return
-        except Exception:
-            pass
-    raise RuntimeError("Ollama did not start within 20 seconds")
 
 
 def extract_keyword(subject: str) -> str:
@@ -46,8 +26,8 @@ async def run() -> None:
             await browser.close()
     send_notification(reenabled)
 
-    new_threads = fetch_new_threads()
-    print(f"Found {len(new_threads)} new f5bot thread(s)")
+    new_threads, seen_to_commit = fetch_new_threads()
+    print(f"Found {len(new_threads)} new thread(s)")
     seen_urls: set[str] = set()
     links: list[tuple[str, str]] = []
     for t in new_threads:
@@ -56,16 +36,14 @@ async def run() -> None:
             if link not in seen_urls:
                 seen_urls.add(link)
                 links.append((link, keyword))
+    print(f"Analyzing {len(links)} post(s)")
     if links:
-        _ensure_ollama()
-        results = await run_analysis(links)
-        for post, analysis in results:
-            print(f"\n=== {post.title} ===")
-            print(f"r/{post.subreddit} | {post.permalink}")
-            print(analysis)
-        send_analyses(results)
+        results = await run_analysis(links, on_flag=send_post)
+        flagged = sum(1 for _, a in results if a.strip().upper().startswith("FLAG"))
+        print(f"{flagged}/{len(results)} flagged")
+    save_seen(seen_to_commit)
+    print("Done")
 
 
 if __name__ == "__main__":
-    load_dotenv()
     asyncio.run(run())
