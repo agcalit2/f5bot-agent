@@ -2,11 +2,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
+import os
 import re
 from playwright.async_api import async_playwright
 from f5bot import login, reenable_keywords
 from notify import send_notification, send_post
 from gmail import fetch_new_threads, save_seen
+from reddit import load_subreddits, fetch_all_subreddits, load_seen_posts, save_seen_posts
 from analyze import run_analysis
 
 
@@ -28,20 +30,40 @@ async def run() -> None:
 
     new_threads, seen_to_commit = fetch_new_threads()
     print(f"Found {len(new_threads)} new thread(s)")
+    seen_posts: set[str] = load_seen_posts()
     seen_urls: set[str] = set()
     links: list[tuple[str, str]] = []
     for t in new_threads:
         keyword = extract_keyword(t["subject"])
         for link in t["reddit_links"]:
-            if link not in seen_urls:
+            if link not in seen_urls and link not in seen_posts:
                 seen_urls.add(link)
                 links.append((link, keyword))
+
+    subreddits = load_subreddits()
+    if subreddits:
+        print(f"Fetching posts from {len(subreddits)} subreddit(s)")
+        subreddit_links = await fetch_all_subreddits(subreddits)
+        subreddit_new_urls: set[str] = set()
+        for url, subreddit in subreddit_links:
+            if url not in seen_urls and url not in seen_posts:
+                seen_urls.add(url)
+                subreddit_new_urls.add(url)
+                links.append((url, subreddit))
+        print(f"  {len(subreddit_new_urls)} new subreddit post(s) added")
+    else:
+        subreddit_new_urls = set()
+
     print(f"Analyzing {len(links)} post(s)")
     if links:
         results = await run_analysis(links, on_flag=send_post)
-        flagged = sum(1 for _, a in results if a.strip().upper().startswith("FLAG"))
-        print(f"{flagged}/{len(results)} flagged")
+        flagged = [a for _, a in results if a.strip().upper().startswith("FLAG")]
+        top_k = int(os.environ.get("TOP_K", "5"))
+        sent = min(len(flagged), top_k)
+        print(f"{len(flagged)}/{len(results)} flagged, {sent} sent (TOP_K={top_k})")
     save_seen(seen_to_commit)
+    seen_posts.update(subreddit_new_urls)
+    save_seen_posts(seen_posts)
     print("Done")
 
 

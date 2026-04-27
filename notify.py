@@ -1,5 +1,7 @@
 from __future__ import annotations
+import html
 import os
+import re
 import httpx
 from datetime import date
 from analyze import AnalyzedPost
@@ -27,12 +29,24 @@ def send_notification(reenabled: list[str]) -> None:
     _send_telegram(token, chat_id, f"{header}\n{body}")
 
 
+def _format_analysis(analysis: str) -> str:
+    why_m = re.search(r"WHY:\s*(.+)", analysis)
+    angle_m = re.search(r"ANGLE:\s*(.+)", analysis)
+    parts = []
+    if why_m:
+        parts.append(html.escape(why_m.group(1).strip()))
+    if angle_m:
+        sentences = re.split(r"(?<=\.)\s+", angle_m.group(1).strip())
+        parts.extend(f"• {html.escape(s)}" for s in sentences[:2])
+    return "\n".join(parts) if parts else html.escape(analysis.strip())
+
+
 def send_post(post: AnalyzedPost, analysis: str) -> None:
     token, chat_id = _get_telegram_config()
     text = (
-        f"<b>r/{post.subreddit}</b> — <i>{post.title}</i>\n"
-        f"{post.permalink}\n"
+        f"<b>r/{html.escape(post.subreddit)}</b> — <i>{html.escape(post.title)}</i>\n"
+        f"{post.url}\n"
         f"\n"
-        f"{analysis[:500]}"
+        f"{_format_analysis(analysis)}"
     )
     _send_telegram(token, chat_id, text)

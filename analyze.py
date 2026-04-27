@@ -25,6 +25,7 @@ _GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 _INSIGHTS_MAX_AGE_DAYS = int(os.environ.get("INSIGHTS_MAX_AGE_DAYS", "7"))
 _ANALYSIS_CONCURRENCY = int(os.environ.get("ANALYSIS_CONCURRENCY", "3"))
 _MAX_RETRIES = 4
+_TOP_K = int(os.environ.get("TOP_K", "5"))
 
 _BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -251,14 +252,26 @@ async def run_analysis(
 
     async def _bounded(url: str, keyword: str) -> tuple[AnalyzedPost, str]:
         async with sem:
-            post, analysis = await asyncio.to_thread(_analyze_link_sync, url, keyword, insights, strategy)
-            if on_flag and analysis.strip().upper().startswith("FLAG"):
-                on_flag(post, analysis)
+            try:
+                post, analysis = await asyncio.to_thread(_analyze_link_sync, url, keyword, insights, strategy)
+            except Exception as exc:
+                print(f"  [error] analysis failed for {url}: {exc}")
+                return AnalyzedPost(url=url, keyword=keyword, title="(error)", subreddit="(error)", score=0), "SKIP (analysis error)"
             return post, analysis
 
-    results = await atqdm.gather(
+    results = list(await atqdm.gather(
         *[_bounded(url, kw) for url, kw in links],
         desc="Analyzing posts",
         unit="post",
-    )
-    return list(results)
+    ))
+
+    if on_flag:
+        flagged = [(p, a) for p, a in results if a.strip().upper().startswith("FLAG")]
+        top_k = sorted(flagged, key=lambda x: x[0].score, reverse=True)[:_TOP_K]
+        for post, analysis in top_k:
+            try:
+                on_flag(post, analysis)
+            except Exception as exc:
+                print(f"  [error] notification failed for {post.url}: {exc}")
+
+    return results
