@@ -7,7 +7,7 @@ Organically promote jgdiff.gg on Reddit by genuinely helping users who are askin
 - Note that the site is more beneficial for junglers, so prioritize engaging in threads where the author is a jungler
 - However, note that the site is still highly useful for non-junglers for regular gameplay analysis
 - Someone is looking for powerful scouting before the game starts
-- Someone is rustrated with their current stats tool or looking for an alternative
+- Someone is frustrated with their current stats tool or looking for an alternative
 - A player is asking how to improve or analyze their gameplay
 
 ## When to Skip
