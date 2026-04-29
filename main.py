@@ -32,35 +32,41 @@ async def run() -> None:
     print(f"Found {len(new_threads)} new thread(s)")
     seen_posts: set[str] = load_seen_posts()
     seen_urls: set[str] = set()
-    links: list[tuple[str, str]] = []
+    f5bot_links: list[tuple[str, str]] = []
     for t in new_threads:
         keyword = extract_keyword(t["subject"])
         for link in t["reddit_links"]:
             if link not in seen_urls and link not in seen_posts:
                 seen_urls.add(link)
-                links.append((link, keyword))
+                f5bot_links.append((link, keyword))
 
     subreddits = load_subreddits()
     if subreddits:
         print(f"Fetching posts from {len(subreddits)} subreddit(s)")
-        subreddit_links = await fetch_all_subreddits(subreddits)
+        subreddit_fetched = await fetch_all_subreddits(subreddits)
         subreddit_new_urls: set[str] = set()
-        for url, subreddit in subreddit_links:
+        subreddit_links: list[tuple[str, str]] = []
+        for url, subreddit in subreddit_fetched:
             if url not in seen_urls and url not in seen_posts:
                 seen_urls.add(url)
                 subreddit_new_urls.add(url)
-                links.append((url, subreddit))
+                subreddit_links.append((url, subreddit))
         print(f"  {len(subreddit_new_urls)} new subreddit post(s) added")
     else:
         subreddit_new_urls = set()
+        subreddit_links = []
 
-    print(f"Analyzing {len(links)} post(s)")
-    if links:
-        results = await run_analysis(links, on_flag=send_post)
-        flagged = [a for _, a in results if a.strip().upper().startswith("FLAG")]
-        top_k = int(os.environ.get("TOP_K", "5"))
-        sent = min(len(flagged), top_k)
-        print(f"{len(flagged)}/{len(results)} flagged, {sent} sent (TOP_K={top_k})")
+    print(f"Analyzing {len(f5bot_links)} f5bot + {len(subreddit_links)} subreddit post(s)")
+
+    if f5bot_links:
+        f5bot_results = await run_analysis(f5bot_links, on_flag=send_post)
+        f5bot_flagged = sum(1 for _, a in f5bot_results if a.strip().upper().startswith("FLAG"))
+        print(f"f5bot: {f5bot_flagged}/{len(f5bot_results)} flagged, all sent")
+
+    if subreddit_links:
+        sub_results = await run_analysis(subreddit_links, on_flag=send_post)
+        sub_flagged = sum(1 for _, a in sub_results if a.strip().upper().startswith("FLAG"))
+        print(f"subreddit: {sub_flagged}/{len(sub_results)} flagged, all sent")
     save_seen(seen_to_commit)
     seen_posts.update(subreddit_new_urls)
     save_seen_posts(seen_posts)

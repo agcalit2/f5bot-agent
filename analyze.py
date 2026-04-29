@@ -25,7 +25,6 @@ _GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 _INSIGHTS_MAX_AGE_DAYS = int(os.environ.get("INSIGHTS_MAX_AGE_DAYS", "7"))
 _ANALYSIS_CONCURRENCY = int(os.environ.get("ANALYSIS_CONCURRENCY", "3"))
 _MAX_RETRIES = 4
-_TOP_K = int(os.environ.get("TOP_K", "5"))
 
 _BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -266,12 +265,11 @@ async def run_analysis(
     ))
 
     if on_flag:
-        flagged = [(p, a) for p, a in results if a.strip().upper().startswith("FLAG")]
-        top_k = sorted(flagged, key=lambda x: x[0].score, reverse=True)[:_TOP_K]
-        for post, analysis in top_k:
-            try:
-                on_flag(post, analysis)
-            except Exception as exc:
-                print(f"  [error] notification failed for {post.url}: {exc}")
+        for post, analysis in results:
+            if analysis.strip().upper().startswith("FLAG"):
+                try:
+                    on_flag(post, analysis)
+                except Exception as exc:
+                    print(f"  [error] notification failed for {post.url}: {exc}")
 
     return results
