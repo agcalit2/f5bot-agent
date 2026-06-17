@@ -17,7 +17,7 @@ from tqdm.asyncio import tqdm as atqdm
 
 _PRODUCT_FILE = "PRODUCT.md"
 _STRATEGY_FILE = "STRATEGY.md"
-_INSIGHTS_FILE = "INSIGHTS.md"
+_INSIGHTS_FILE = "PersistentStorage/INSIGHTS.md"
 
 _MAX_PAGE_CHARS = 8_000
 _RESEARCH_MODEL = "claude-opus-4-7"
@@ -73,8 +73,13 @@ def research_product() -> str:
     if os.path.exists(_INSIGHTS_FILE):
         age_days = (time.time() - os.path.getmtime(_INSIGHTS_FILE)) / 86400
         if age_days < _INSIGHTS_MAX_AGE_DAYS:
+            print(f"  [insights] Using cached insights ({age_days:.1f}d old, limit {_INSIGHTS_MAX_AGE_DAYS}d)")
             with open(_INSIGHTS_FILE, encoding="utf-8") as f:
                 return f.read()
+        else:
+            print(f"  [insights] Cached insights too old ({age_days:.1f}d > {_INSIGHTS_MAX_AGE_DAYS}d), re-running research")
+    else:
+        print(f"  [insights] No cached insights found at {_INSIGHTS_FILE}, running research")
 
     if not os.path.exists(_PRODUCT_FILE):
         raise FileNotFoundError(
@@ -173,6 +178,7 @@ def research_product() -> str:
     )
     with open(_INSIGHTS_FILE, "w", encoding="utf-8") as f:
         f.write(insights)
+    print(f"  [insights] New insights written to {_INSIGHTS_FILE}")
     return insights
 
 
