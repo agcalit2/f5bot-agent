@@ -1,9 +1,7 @@
-import json
 import os
 import re
 import httpx
 
-SEEN_POSTS_PATH = "seen_posts.json"
 REDDIT_API_BASE = "https://www.reddit.com"
 
 
@@ -20,19 +18,6 @@ def load_subreddits(path: str = "SUBREDDITS.md") -> list[str]:
             ]
     except FileNotFoundError:
         return []
-
-
-def load_seen_posts(path: str = SEEN_POSTS_PATH) -> set[str]:
-    try:
-        with open(path) as f:
-            return set(json.load(f))
-    except FileNotFoundError:
-        return set()
-
-
-def save_seen_posts(urls: set[str], path: str = SEEN_POSTS_PATH) -> None:
-    with open(path, "w") as f:
-        json.dump(list(urls), f)
 
 
 async def fetch_subreddit_posts(subreddit: str, limit: int = 100) -> list[str]:
